@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ingestion Report</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --card: #ffffff; --text: #1d1d1b; --muted: #66665f;
+    --line: #e2e2dc; --accent: #2f5d8a; --bad: #b3261e; --warn: #8a5a00;
+    --ok: #2e6b3a; --chip: #efefea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --card: #1f1f1d; --text: #ececE8; --muted: #a3a39b;
+      --line: #33332f; --accent: #8fb7e0; --bad: #f2a29b; --warn: #e8c06d;
+      --ok: #8fcf9b; --chip: #2a2a27;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .picker { display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+            background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+            padding: 14px 16px; margin-bottom: 24px; }
+  .picker label { font-weight: 600; background: var(--accent); color: var(--card);
+                  padding: 8px 14px; border-radius: 8px; cursor: pointer; }
+  .picker input { position: absolute; left: -9999px; }
+  #status { color: var(--muted); }
+  #status.error { color: var(--bad); }
+  .run { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+         padding: 18px 18px 8px; margin-bottom: 20px; }
+  .run-head { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; }
+  .run-head h2 { font-size: 1.1rem; margin: 0; }
+  .meta { color: var(--muted); }
+  .badge { display: inline-block; font-size: 0.8rem; font-weight: 600; padding: 2px 8px;
+           border-radius: 999px; background: var(--chip); }
+  .badge.SUCCESS { color: var(--ok); }
+  .badge.FAILED { color: var(--bad); }
+  .error-box { color: var(--bad); margin: 8px 0 0; }
+  .counts { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 10px; margin: 14px 0; }
+  .count { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  .count b { display: block; font-size: 1.35rem; font-variant-numeric: tabular-nums; }
+  .count span { color: var(--muted); font-size: 0.85rem; }
+  h3 { font-size: 1rem; margin: 18px 0 6px; }
+  .note { color: var(--muted); margin: 0 0 8px; font-size: 0.9rem; }
+  .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px;
+                margin-bottom: 12px; max-height: 480px; overflow-y: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.88rem; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line);
+           vertical-align: top; }
+  th { position: sticky; top: 0; background: var(--card); font-weight: 600; }
+  td.num { font-variant-numeric: tabular-nums; }
+  code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.85em;
+         background: var(--chip); padding: 1px 4px; border-radius: 4px; word-break: break-all; }
+  .reason { color: var(--bad); font-weight: 600; }
+  .skip { color: var(--muted); font-weight: 600; }
+  .warncode { color: var(--warn); font-weight: 600; }
+  .lookup { color: var(--accent); font-weight: 600; white-space: nowrap; }
+  .empty { color: var(--muted); font-style: italic; margin: 0 0 12px; }
+  details summary { cursor: pointer; font-weight: 600; margin: 12px 0 6px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Ingestion Report</h1>
+  <p class="sub">Runs from ingestion-log.json, newest first.</p>
+
+  <div class="picker">
+    <label for="file">Open ingestion-log.json</label>
+    <input type="file" id="file" accept=".json,application/json">
+    <span id="status">No log opened yet.</span>
+  </div>
+
+  <div id="runs"></div>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  var COUNT_LABELS = [
+    ["rows_read", "Rows read"],
+    ["rows_loaded", "Loaded"],
+    ["rows_updated", "Updated"],
+    ["rows_skipped_duplicate", "Skipped: duplicate in file"],
+    ["rows_skipped_already_exists", "Skipped: already in database"],
+    ["rows_rejected", "Rejected"]
+  ];
+
+  function esc(value) {
+    if (value === null || value === undefined) return "";
+    return String(value).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function code(value) {
+    if (value === null || value === undefined || value === "") return "<span class=\"meta\">(empty)</span>";
+    return "<code>" + esc(value) + "</code>";
+  }
+
+  function list(items) {
+    return (items || []).map(esc).join("<br>");
+  }
+
+  function table(headers, rows) {
+    return "<div class=\"table-wrap\"><table><thead><tr>" +
+      headers.map(function (h) { return "<th>" + esc(h) + "</th>"; }).join("") +
+      "</tr></thead><tbody>" + rows.join("") + "</tbody></table></div>";
+  }
+
+  function reviewKey(entry) { return entry.line; }
+
+  function renderRun(run) {
+    var counts = run.counts || {};
+    var review = run.needs_manual_review || [];
+    var reviewLines = {};
+    review.forEach(function (r) { reviewLines[reviewKey(r)] = r.codes || []; });
+
+    var html = "<section class=\"run\">";
+    html += "<div class=\"run-head\"><h2>" + esc(run.file) + "</h2>" +
+            "<span class=\"badge " + esc(run.status) + "\">" + esc(run.status) + "</span>" +
+            "<span class=\"meta\">" + esc(run.timestamp) + "</span></div>";
+    if (run.error) html += "<p class=\"error-box\">Error: " + esc(run.error) +
+                           ". books.db was not changed by this run.</p>";
+
+    html += "<div class=\"counts\">" + COUNT_LABELS.map(function (pair) {
+      var v = counts[pair[0]];
+      return "<div class=\"count\"><b>" + esc(v === undefined ? "—" : v) + "</b><span>" +
+             esc(pair[1]) + "</span></div>";
+    }).join("") + "</div>";
+
+    // Manual catalog lookup
+    html += "<h3>Needs manual catalog lookup (" + review.length + ")</h3>";
+    if (review.length) {
+      html += table(["Line", "Title", "Raw isbn", "Raw isbn13", "Why"],
+        review.map(function (r) {
+          return "<tr><td class=\"num\">" + esc(r.line) + "</td><td>" + esc(r.title) + "</td><td>" +
+                 code(r.raw_isbn) + "</td><td>" + code(r.raw_isbn13) + "</td><td class=\"warncode\">" +
+                 list(r.codes) + "</td></tr>";
+        }));
+    } else {
+      html += "<p class=\"empty\">None.</p>";
+    }
+
+    // Rows not loaded
+    var notLoaded = run.not_loaded || [];
+    var rejected = notLoaded.filter(function (r) { return r.status === "rejected"; });
+    var skipped = notLoaded.filter(function (r) { return r.status !== "rejected"; });
+
+    function notLoadedRows(rows) {
+      return rows.map(function (r) {
+        var cls = r.status === "rejected" ? "reason" : "skip";
+        var flag = reviewLines[r.line] ? "<br><span class=\"lookup\">Manual lookup</span>" : "";
+        return "<tr><td class=\"num\">" + esc(r.line) + "</td><td class=\"" + cls + "\">" +
+               esc(r.reason).split(",").join("<br>") + flag + "</td><td>" + esc(r.title) + "</td><td>" +
+               code(r.raw_isbn) + "</td><td>" + code(r.raw_isbn13) + "</td><td>" + list(r.details) +
+               "</td></tr>";
+      });
+    }
+
+    html += "<h3>Rejected rows (" + rejected.length + ")</h3>";
+    html += rejected.length
+      ? table(["Line", "Reason", "Title", "Raw isbn", "Raw isbn13", "Details"], notLoadedRows(rejected))
+      : "<p class=\"empty\">None.</p>";
+
+    html += "<h3>Skipped rows (" + skipped.length + ")</h3>";
+    html += "<p class=\"note\">Duplicates within the file and rows already in books.db.</p>";
+    html += skipped.length
+      ? table(["Line", "Status", "Title", "Raw isbn", "Raw isbn13", "Details"], notLoadedRows(skipped))
+      : "<p class=\"empty\">None.</p>";
+
+    // Warnings
+    var warnings = run.warnings || [];
+    html += "<h3>Warnings (" + warnings.length + ")</h3>";
+    html += warnings.length
+      ? table(["Line", "Warning", "Row status", "Title", "Stored ISBN-13", "Raw isbn", "Raw isbn13", "Details"],
+          warnings.map(function (w) {
+            var flag = reviewLines[w.line] ? "<br><span class=\"lookup\">Manual lookup</span>" : "";
+            return "<tr><td class=\"num\">" + esc(w.line) + "</td><td class=\"warncode\">" +
+                   list(w.codes) + flag + "</td><td>" + esc(w.row_status) + "</td><td>" + esc(w.title) +
+                   "</td><td>" + code(w.isbn13) + "</td><td>" + code(w.raw_isbn) + "</td><td>" +
+                   code(w.raw_isbn13) + "</td><td>" + list(w.details) + "</td></tr>";
+          }))
+      : "<p class=\"empty\">None.</p>";
+
+    html += "</section>";
+    return html;
+  }
+
+  function render(runs) {
+    var ordered = runs.map(function (run, i) { return { run: run, i: i }; });
+    // Newest first: ISO 8601 UTC timestamps sort as text; later log entries win ties.
+    ordered.sort(function (a, b) {
+      var ta = String(a.run.timestamp || ""), tb = String(b.run.timestamp || "");
+      if (ta !== tb) return ta < tb ? 1 : -1;
+      return b.i - a.i;
+    });
+    document.getElementById("runs").innerHTML = ordered.map(function (o) {
+      return renderRun(o.run);
+    }).join("");
+  }
+
+  document.getElementById("file").addEventListener("change", function (event) {
+    var status = document.getElementById("status");
+    var file = event.target.files && event.target.files[0];
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      var data;
+      try {
+        data = JSON.parse(reader.result);
+      } catch (e) {
+        status.className = "error";
+        status.textContent = file.name + " is not valid JSON: " + e.message;
+        document.getElementById("runs").innerHTML = "";
+        return;
+      }
+      if (!Array.isArray(data)) {
+        status.className = "error";
+        status.textContent = file.name + " is not a list of runs.";
+        document.getElementById("runs").innerHTML = "";
+        return;
+      }
+      status.className = "";
+      status.textContent = file.name + ": " + data.length + (data.length === 1 ? " run" : " runs");
+      render(data);
+    };
+    reader.onerror = function () {
+      status.className = "error";
+      status.textContent = "Could not read " + file.name + ".";
+    };
+    reader.readAsText(file);
+  });
+})();
+</script>
+</body>
+</html>
